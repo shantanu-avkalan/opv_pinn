@@ -1,0 +1,77 @@
+basisRelativeOrder = 1
+typeOfIC = 1
+
+# Mobilities of electron (n), hole (p) and exciton (x). Unit: (m^2/Vs)
+mu_n = 2e-7
+mu_p = 1.5e-7
+mu_x = 3.9e-9
+
+# Mobility coefficient of particles as minority charge carrieres
+# for example, electron mobility in donor material will be mu_n*muRatio
+muRatio = 0.01
+
+# Relative dielectric constants of donor (D) and acceptor (A)
+eps_A = 3.9
+eps_D = 3.0
+
+#potential difference between LUMO of acceptor and HOMO of donor, unit: eV.
+E_g = 1.1
+
+# Thickness of interfacial area, in meter
+interfaceThk = 2e-9
+# Thickness of the domain, in meter
+Height = 100e-9
+# temperature, in K
+T = 300
+# Estimated open circuit voltage, so the calculation stops here
+Voc = 1.00
+
+# e-h separation distance, in meter
+a = 1.8e-9
+
+# lifetime of exciton (unit: s)
+tau_x = 1e-6
+
+# It is difficult to include 100% interfacial potential, so for most of the time, only a small fraction is added.
+# use potentialFactor = 0.05 to added 5% real interfacial potential or 0 to neglected interfacial potential.
+# In this version, please keep it 0.
+potentialFactor = 0
+
+# V_app_step (in eV) is the applied voltage step for Jv curve. At the turn of the JV curve, we need small steps to capture fill factor
+V_app_step = 0.02
+# dV_app_ratio: Ratio of large applied voltage to fine calculation. At lower Vapp, we can use large step to save calculation time
+# So at lower Vapp, the V_app_step really is V_app_step = V_app_step*dV_app_ratio
+# For example, with "V_app_step = 0.02, dV_app_ratio = 5", you will start with Vapp step of 0.1eV(=0.02*5)
+# and when the JV curve change rapidly your Vapp step is 0.02eV
+dV_app_ratio = 5
+
+# Mesh clustering option: if you want clustered mesh, beta=0.02 is recommended, otherwise use 0 for even mesh.
+# Smaller beta value means more clustered mesh.
+beta = 0.0
+
+# Morphology file name
+morphology_file = "sample_morph_ids.txt"
+
+# Exciton generation rate (unit: m^-3 s^-1)
+Gx = 1e28
+
+# adding hole/electron transporting layers. This is ratio to the thickness of active layer, if not zero, you have to
+# set the thickness of the whole domain to be Height=(2*transportLayerThickness+1)*Height
+transportLayer = 0.0
+
+# if weak_bc = 1 then weak boundary is used for electrode contacts, otherwise Neumann boundary condition is used.
+# For now leave it as '0'
+weak_bc = 0
+
+# whether to do jsc calculation through semi fermi level calculations
+semi_fermi_Jsc_calc = false
+
+max_x = 0.25
+max_y = 1
+
+basisFunction = "linear" # "quadratic"
+mfree = false # "true"
+refine_lvl = 5
+boundary_refine_lvl = 12
+
+boundary_integration_rel_order = 0
