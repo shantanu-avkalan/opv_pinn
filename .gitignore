@@ -34,3 +34,4 @@ Thumbs.db
 .idea/
 
 ff_data
+scripts/morphology_test.py
