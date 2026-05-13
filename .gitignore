@@ -34,3 +34,6 @@ Thumbs.db
 .idea/
 
 ff_data
+scripts/runs
+scripts/opv_diag.py
+scripts/opv_pinn_generalised.py

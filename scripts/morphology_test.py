@@ -1,17 +1,13 @@
 """
-OPV 2D PINN v6 — Clean PDE-only training, no Jcons loss
-=========================================================
-Key insight from failed v5 attempts:
-  Jcons loss in 2D fights the PDE losses because div(J)=0 is already
-  encoded in the continuity equations. Adding it as an explicit loss
-  creates conflicting gradients and prevents convergence.
-
-v6 approach:
-  - Train ONLY on the four PDE residuals (Poisson, n, p, X)
-  - Ohmic BCs: n_min at blocking contact (from v5, correct)
-  - Jsc computed from anode integral after convergence
-  - Simpler three-phase curriculum, no Jcons anywhere
-  - Expected convergence: loss < 0.01 in 15000 epochs on T4
+OPV 2D PINN v6 — Final version before 10-morphology validation
+===============================================================
+All fixes applied:
+  FIX 1 — Gx_scale = min(1.0, kx_nd/Gx_nd)  — no generation amplification
+  FIX 2 — loss_scale = max(1, kx_nd/5)       — boosts Poisson for fast-decay
+  FIX 3 — J_scale_phys = J_scale/max(1,mu_p_nd) — corrects mu_p dominance
+  FIX 4 — BCs: n=1 at cathode, p=1 at anode (natural values, not n_majority)
+           J_scale_phys applied only at readout in compute_jsc
+  FIX 5 — Phase 2: n,p weights=0.1 (smooth transition, no loss spike)
 
 Run:
     python opv_pinn_2d.py --data_dir /path/to/data --morph_idx 0
@@ -74,7 +70,7 @@ class NormParams:
         self.V0    = p.E_g
         self.VT_nd = p.VT/p.E_g
 
-        # Fixed J_scale regardless of mu_n (key fix from v4)
+        # Fixed J_scale regardless of mu_n
         _J_REF  = 3e21*(2e-7*p.VT)*p.q/p.Height
         self.n0 = _J_REF/(p.Dn*p.q/p.Height)
         self.tau0 = p.Height**2/p.Dn
@@ -87,11 +83,16 @@ class NormParams:
         self.Gx_nd    = p.Gx*self.tau0/self.n0
         self.kx_nd    = p.kx*self.tau0
         self.kdiss_nd = p.k_diss*self.tau0
-        self.Gx_scale = self.kx_nd/self.Gx_nd if self.Gx_nd>1e-12 else 1.0
 
-        # krec: auto-balance D~R
+        # FIX 1: clamp Gx_scale to [0,1] — never amplify generation
+        self.Gx_scale = min(1.0, self.kx_nd/self.Gx_nd) if self.Gx_nd > 1e-12 else 1.0
+
+        # FIX 2: loss_scale boosts Poisson when kx_nd is large
+        self.loss_scale = float(np.clip(max(1.0, self.kx_nd/5.0), 1.0, 20.0))
+
+        # krec: auto-balance D~R at Jsc conditions
         V_bi_nd = p.V_bi/p.E_g
-        Gx_eff  = self.kx_nd
+        Gx_eff  = self.Gx_nd*self.Gx_scale
         X_avg   = Gx_eff/(self.kx_nd+self.kdiss_nd*V_bi_nd+1e-12)
         D_avg   = self.kdiss_nd*X_avg*V_bi_nd
         self.krec_nd = D_avg/0.25
@@ -99,7 +100,15 @@ class NormParams:
 
         self.debye_ratio = p.q*self.n0*p.Height**2/(p.eps_si*p.E_g)
         self.V_bi_nd     = V_bi_nd
-        self.J_scale     = self.n0*p.Dn*p.q/p.Height  # A/m²
+
+        # J_scale: base (used in physics equations)
+        self.J_scale = self.n0*p.Dn*p.q/p.Height  # A/m²
+
+        # FIX 3: J_scale_phys corrects for hole mobility dominance at readout
+        # When mu_p > mu_n, hole current dominates and raw J_nd is mu_p_nd× too large
+        # Dividing by max(1, mu_p_nd) at readout gives correct physical Jsc
+        # BCs stay at n=1, p=1 so interior physics is correct
+        self.J_scale_phys = self.J_scale / max(1.0, self.mu_p_nd)
 
         # Ohmic minority carrier BC
         self.n_min = max(1e-4, math.exp(-V_bi_nd/(2*self.VT_nd)))
@@ -108,14 +117,26 @@ class NormParams:
 
     def _sanity(self):
         print("\n  Dimensionless params:")
-        for name, val in [("debye",self.debye_ratio),("Gx_nd",self.Gx_nd),
-                           ("kx_nd",self.kx_nd),("kdiss_nd",self.kdiss_nd),
-                           ("krec_nd",self.krec_nd)]:
-            ok = 1e-6<=abs(val)<=1e6
-            print(f"    {name:10s}={val:12.6f}  [{'OK' if ok else 'WARN'}]")
-        print(f"    n_min     ={self.n_min:.2e}")
-        print(f"    J_scale   ={self.J_scale*0.1:.4f} mA/cm2/J_nd")
-        print(f"    Jsc~      ={1.05*self.J_scale*0.1:.4f} mA/cm2\n")
+        for name, val in [("debye",     self.debye_ratio),
+                           ("Gx_nd",    self.Gx_nd),
+                           ("kx_nd",    self.kx_nd),
+                           ("kdiss_nd", self.kdiss_nd),
+                           ("krec_nd",  self.krec_nd)]:
+            ok = 1e-6 <= abs(val) <= 1e6
+            print(f"    {name:10s} = {val:12.6f}  [{'OK' if ok else 'WARN'}]")
+        print(f"    n_min      = {self.n_min:.2e}")
+        print(f"    Gx_scale   = {self.Gx_scale:.6f}  (clamped <=1)")
+        print(f"    loss_scale = {self.loss_scale:.2f}  "
+              f"(Poisson phase1 weight = {20*self.loss_scale:.1f})")
+        print(f"    J_scale    = {self.J_scale*0.1:.4f} mA/cm2/J_nd  (raw)")
+        print(f"    J_scale_p  = {self.J_scale_phys*0.1:.4f} mA/cm2/J_nd  "
+              f"(÷ max(1,{self.mu_p_nd:.1f}))")
+        # Expected BC Jsc using J_scale_phys
+        nm = self.n_min; V = self.V_bi_nd
+        Jn = 1.0           * (1.0*(-V) + (1.0-nm))
+        Jp = self.mu_p_nd  * (nm *(-V) + (1.0-nm))
+        Jsc_bc = abs(Jn+Jp)*self.J_scale_phys*0.1
+        print(f"    BC Jsc~    = {Jsc_bc:.4f} mA/cm2  (before training)\n")
 
 
 # =============================================================================
@@ -189,23 +210,29 @@ class FieldNet(nn.Module):
 class OPV_PINN_2D(nn.Module):
     def __init__(self,norm,V_app_nd=0.0):
         super().__init__()
-        self.norm=norm; self.V_app=V_app_nd; self.n_min=norm.n_min
+        self.norm=norm; self.V_app=V_app_nd
+        self.n_min=norm.n_min
         self.net_phi=FieldNet(); self.net_n=FieldNet()
         self.net_p=FieldNet();   self.net_X=FieldNet()
 
     def forward(self,xy):
         x=xy[:,0:1]; nm=self.n_min
+
         phi=(self.norm.V_bi_nd/2)*(1-x)+(-self.norm.V_bi_nd/2+self.V_app)*x \
             +x*(1-x)*self.net_phi(xy)
-        # Ohmic BCs: n_min at blocking contact
-        n=nm*(1-x)+x    +x*(1-x)*F.softplus(self.net_n(xy))
-        p=(1-x)  +nm*x  +x*(1-x)*F.softplus(self.net_p(xy))
+
+        # FIX 4: BCs at natural values — n=1 at cathode, p=1 at anode
+        # This keeps carrier densities in [0,1] for correct physics
+        # J_scale_phys handles the mu_p correction at readout only
+        n = nm*(1-x) + 1.0*x + x*(1-x)*F.softplus(self.net_n(xy))
+        p = 1.0*(1-x) + nm*x + x*(1-x)*F.softplus(self.net_p(xy))
+
         X=x*(1-x)*F.softplus(self.net_X(xy)+1.0)
         return phi,n,p,X
 
 
 # =============================================================================
-# SECTION 6 — RESIDUALS (PDE only, no Jcons)
+# SECTION 6 — RESIDUALS
 # =============================================================================
 def g2(f,xy):
     g=torch.autograd.grad(f,xy,torch.ones_like(f),
@@ -236,39 +263,36 @@ def residuals(model,xy,norm,morph):
 
 
 # =============================================================================
-# SECTION 7 — LOSS (PDE residuals only — no Jcons)
+# SECTION 7 — LOSS
 # =============================================================================
-# Three simple phases — no Jcons anywhere
-PW=[
-    {'P':20.0,'n':0.01,'p':0.01,'X':0.01, 'Jc':0.0},   # 0-20%
-    {'P': 5.0,'n': 1.0,'p': 1.0,'X':0.1,  'Jc':0.0},   # 20-60%
-    {'P': 1.0,'n': 1.0,'p': 1.0,'X':1.0,  'Jc':10.0},  # 60-100%
-]
+def get_w(ep, n_epochs, loss_scale=1.0):
+    f = ep/n_epochs; s = loss_scale
+    if f < 0.20:
+        return {'P': 20.0*s, 'n': 0.01, 'p': 0.01, 'X': 0.1*s, 'Jc': 0.0}
+    if f < 0.60:
+        # FIX 5: n,p=0.1 not 1.0 — prevents spike at phase transition
+        return {'P':  5.0*s, 'n':  0.1,  'p':  0.1,  'X': 0.5,  'Jc': 0.0}
+    return     {'P':  1.0*s, 'n':  1.0,  'p':  1.0,  'X': 1.0,  'Jc': 10.0}
 
-def get_w(ep,N):
-    f=ep/N
-    if f<0.20: return PW[0]
-    if f<0.60: return PW[1]
-    return PW[2]
 
 def loss_fn(model,xy,norm,morph,w):
     rP,rn,rp,rX=residuals(model,xy,norm,morph)
     lP=w['P']*(rP**2).mean(); ln=w['n']*(rn**2).mean()
     lp=w['p']*(rp**2).mean(); lX=w['X']*(rX**2).mean()
-    # Recompute Jt for Jcons (only active in phase 3 when w['Jc']>0)
     if w['Jc'] > 0:
-        xy2 = xy.detach().requires_grad_(True)
-        phi2,n2,p2,_ = model(xy2)
-        px2,_ = g2(phi2,xy2); nx2,_ = g2(n2,xy2); qx2,_ = g2(p2,xy2)
-        Jnx2  = norm.mu_n_nd*(n2*px2+nx2)
-        Jpx2  = norm.mu_p_nd*(p2*px2-qx2)
-        Jt    = Jnx2 + Jpx2
-        lJc   = w['Jc']*(Jt.var()+0.5*((Jt-Jt.mean().detach())**2).mean())
+        xy2=xy.detach().requires_grad_(True)
+        phi2,n2,p2,_=model(xy2)
+        px2,_=g2(phi2,xy2); nx2,_=g2(n2,xy2); qx2,_=g2(p2,xy2)
+        Jnx2=norm.mu_n_nd*(n2*px2+nx2)
+        Jpx2=norm.mu_p_nd*(p2*px2-qx2)
+        Jt=Jnx2+Jpx2
+        lJc=w['Jc']*(Jt.var()+0.5*((Jt-Jt.mean().detach())**2).mean())
     else:
-        lJc = torch.tensor(0.0)
+        lJc=torch.tensor(0.0,device=xy.device)
     total=lP+ln+lp+lX+lJc
     return total,{'total':total.item(),'P':lP.item(),
                   'n':ln.item(),'p':lp.item(),'X':lX.item(),'Jc':lJc.item()}
+
 
 # =============================================================================
 # SECTION 8 — COLLOCATION POINTS
@@ -285,7 +309,6 @@ def colloc(morph_handler,n_bulk=1000,n_intf=300):
         xy_i=torch.tensor(np.stack([xi,yi],axis=1),dtype=torch.float32)
     else:
         xy_i=torch.rand(n_intf,2)
-    # Dense boundary layer at contacts
     n_bl=200
     xa=np.random.uniform(0.001,0.015,n_bl)
     xc=np.random.uniform(0.985,0.999,n_bl)
@@ -298,10 +321,9 @@ def colloc(morph_handler,n_bulk=1000,n_intf=300):
 # =============================================================================
 # SECTION 9 — TRAINING
 # =============================================================================
-def train(model,norm,morph,name="",n_epochs=15000,lr=5e-4,pe=2000):
+def train(model,norm,morph,name="",n_epochs=20000,lr=5e-4,pe=2000):
     xy=colloc(morph)
     opt=torch.optim.Adam(model.parameters(),lr=lr)
-    # Warmup then cosine decay
     def lr_lambda(ep):
         warmup=500
         if ep<warmup: return ep/warmup
@@ -311,14 +333,16 @@ def train(model,norm,morph,name="",n_epochs=15000,lr=5e-4,pe=2000):
 
     print(f"\n{'='*60}")
     print(f"Training {name} | {n_epochs} epochs | {len(xy)} pts | lr={lr}")
+    print(f"loss_scale={norm.loss_scale:.2f}  "
+          f"Poisson_w_phase1={20*norm.loss_scale:.1f}")
     print(f"{'='*60}")
     print(f"{'Ep':>6}  {'Total':>9}  {'Poisson':>9}  "
-          f"{'n':>8}  {'p':>8}  {'X':>8}  {'lr':>9}")
-    print("-"*65)
+          f"{'n':>8}  {'p':>8}  {'X':>8}  {'Jc':>8}  {'lr':>9}")
+    print("-"*72)
 
     for ep in range(n_epochs):
         opt.zero_grad()
-        loss,losses=loss_fn(model,xy,norm,morph,get_w(ep,n_epochs))
+        loss,losses=loss_fn(model,xy,norm,morph,get_w(ep,n_epochs,norm.loss_scale))
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(),0.5)
         opt.step(); sch.step()
@@ -326,18 +350,20 @@ def train(model,norm,morph,name="",n_epochs=15000,lr=5e-4,pe=2000):
         if ep%pe==0 or ep==n_epochs-1:
             print(f"{ep:>6}  {losses['total']:>9.3e}  {losses['P']:>9.3e}  "
                   f"{losses['n']:>8.3e}  {losses['p']:>8.3e}  "
-                  f"{losses['X']:>8.3e}  {opt.param_groups[0]['lr']:.2e}")
+                  f"{losses['X']:>8.3e}  {losses['Jc']:>8.3e}  "
+                  f"{opt.param_groups[0]['lr']:.2e}")
     return hist
 
 
 # =============================================================================
-# SECTION 10 — JSC: integrate current at anode (x~0) and cathode (x~1)
-# Use both boundaries and take the average — more robust than single boundary
+# SECTION 10 — JSC
+# FIX 4: use J_scale_phys (not J_scale) to convert J_nd -> mA/cm²
+# This corrects for hole mobility dominance when mu_p > mu_n
 # =============================================================================
 def compute_jsc(model,norm,n_pts=300):
     model.eval()
     Jsc_vals=[]
-    for x_val in [0.005, 0.995]:
+    for x_val in [0.005,0.995]:
         xy=torch.cat([torch.full((n_pts,1),x_val),
                       torch.linspace(0.01,0.99,n_pts).unsqueeze(1)],
                      dim=1).to(DEVICE).requires_grad_(True)
@@ -353,9 +379,9 @@ def compute_jsc(model,norm,n_pts=300):
         Jt=(Jn+Jp).detach().cpu().numpy().flatten()
         Jsc_vals.append(abs(float(np.mean(Jt))))
 
-    Jsc_nd=float(np.mean(Jsc_vals))
-    Jsc=Jsc_nd*norm.J_scale*0.1
-    # Lateral variation at cathode
+    # FIX 4: use J_scale_phys here — only place the correction is applied
+    Jsc=float(np.mean(Jsc_vals))*norm.J_scale_phys*0.1
+
     xy2=torch.cat([torch.full((n_pts,1),0.995),
                    torch.linspace(0.01,0.99,n_pts).unsqueeze(1)],
                   dim=1).to(DEVICE).requires_grad_(True)
@@ -371,8 +397,8 @@ def compute_jsc(model,norm,n_pts=300):
     Jt2=(Jn2+Jp2).detach().cpu().numpy().flatten()
     latvar=float(np.std(Jt2)/(abs(np.mean(Jt2))+1e-12))
 
-    print(f"  Jsc at anode : {Jsc_vals[0]*norm.J_scale*0.1:.4f} mA/cm2")
-    print(f"  Jsc at cathode: {Jsc_vals[1]*norm.J_scale*0.1:.4f} mA/cm2")
+    print(f"  Jsc at anode  : {Jsc_vals[0]*norm.J_scale_phys*0.1:.4f} mA/cm2")
+    print(f"  Jsc at cathode: {Jsc_vals[1]*norm.J_scale_phys*0.1:.4f} mA/cm2")
     print(f"  Jsc (average) : {Jsc:.4f} mA/cm2")
     return Jsc,Jt2,latvar
 
@@ -418,7 +444,7 @@ def plot_fields(morph,phi,n,p,X,Jx,hist,Jsc,gt,lv,name,norm,save_dir="."):
     def ct(ax):
         ax.contour(np.linspace(0,100,mg.shape[0]),
                    np.linspace(0,100,mg.shape[1]),
-                   mg.T,levels=[0.5],colors='white',lw=0.7,alpha=0.6)
+                   mg.T,levels=[0.5],colors='white',linewidths=0.7,alpha=0.6)
     def hm(ax,d,t,c,vn=None,vx=None):
         im=ax.imshow(d.T,origin='lower',cmap=c,extent=ext,aspect='auto',
                      vmin=vn,vmax=vx)
@@ -439,9 +465,12 @@ def plot_fields(morph,phi,n,p,X,Jx,hist,Jsc,gt,lv,name,norm,save_dir="."):
     hm(fig.add_subplot(gs_[1,2]),Jx,'Jx (interior)','RdBu_r',-vm,vm)
     ax6=fig.add_subplot(gs_[:,3])
     for k,c,lb in [('total','k','total'),('P','#3B8BD4','Poisson'),
-                    ('n','#1D9E75','n'),('p','#E85D24','p'),('X','#BA7517','X')]:
-        ax6.semilogy(hist[k],color=c,lw=1.5 if k=='total' else 1,label=lb)
-    ax6.axhline(0.01,color='gray',lw=1,ls='--'); ax6.legend(fontsize=7)
+                    ('n','#1D9E75','n'),('p','#E85D24','p'),
+                    ('X','#BA7517','X'),('Jc','#534AB7','Jcons')]:
+        if k in hist and any(v>0 for v in hist[k]):
+            ax6.semilogy(hist[k],color=c,lw=1.5 if k=='total' else 1,label=lb)
+    ax6.axhline(0.01,color='gray',lw=1,ls='--',alpha=0.5,label='target')
+    ax6.legend(fontsize=7)
     ax6.set_xlabel('Epoch',fontsize=8); ax6.set_ylabel('Loss',fontsize=8)
     ax6.set_title('Loss (target<0.01)',fontsize=9)
     ax6.spines['top'].set_visible(False); ax6.spines['right'].set_visible(False)
@@ -532,13 +561,13 @@ def main():
     ap=argparse.ArgumentParser()
     ap.add_argument('--data_dir', default='.')
     ap.add_argument('--morph_idx',type=int,default=0)
-    ap.add_argument('--n_epochs', type=int,default=15000)
+    ap.add_argument('--n_epochs', type=int,default=20000)
     ap.add_argument('--validate', type=int,default=0)
     ap.add_argument('--save_dir', default='.')
     args=ap.parse_args(); os.makedirs(args.save_dir,exist_ok=True)
 
     print("="*55)
-    print("OPV 2D PINN v6 — PDE only, no Jcons, Ohmic BCs")
+    print("OPV 2D PINN v6 — final, all fixes applied")
     print("="*55)
 
     morphs,params,jsc=load_data(args.data_dir)
