@@ -243,7 +243,7 @@ class MorphologyHandler:
 
     def _phase(self, xy):
         p = self.interp(xy.detach().cpu().numpy()).astype(np.float32)
-        return torch.sigmoid(20*(torch.tensor(p).unsqueeze(1).to(xy.device)-0.5))
+        return torch.sigmoid(10*(torch.tensor(p).unsqueeze(1).to(xy.device)-0.5))
 
     def get_Gx(self, xy):
         return self.norm.Gx_nd*self.norm.Gx_scale*self._phase(xy)
@@ -331,8 +331,17 @@ def get_w(ep, N, s):
 
 def loss_fn(model, xy, norm, morph, w):
     rP, rn, rp, rX, Jt = residuals(model, xy, norm, morph)
-    lP = w['P']*(rP**2).mean(); ln = w['n']*(rn**2).mean()
-    lp = w['p']*(rp**2).mean(); lX = w['X']*(rX**2).mean()
+    # Interface mask: peaks at 1.0 where phase=0.5 (donor-acceptor boundary)
+    # 1x weight in bulk, 4x weight at interfaces
+    phase_vals  = morph._phase(xy).detach()
+    intf_mask   = 4.0 * phase_vals * (1.0 - phase_vals)   # in [0, 1]
+    intf_weight = 1.0 + 3.0 * intf_mask                   # in [1, 4]
+
+    lP = w['P'] * (rP**2 * intf_weight).mean()
+    ln = w['n'] * (rn**2 * intf_weight).mean()
+    lp = w['p'] * (rp**2 * intf_weight).mean()
+    lX = w['X'] * (rX**2 * intf_weight).mean()
+
     if w['Jc'] > 0:
         xy2 = xy.detach().requires_grad_(True)
         phi2, n2, p2, _ = model(xy2)
@@ -341,6 +350,7 @@ def loss_fn(model, xy, norm, morph, w):
         lJc = w['Jc']*(Jt2.var()+0.5*((Jt2-Jt2.mean().detach())**2).mean())
     else:
         lJc = torch.tensor(0.0, device=xy.device)
+
     total = lP+ln+lp+lX+lJc
     return total, {'total':total.item(),'P':lP.item(),
                    'n':ln.item(),'p':lp.item(),'X':lX.item(),'Jc':lJc.item()}
@@ -352,7 +362,8 @@ def loss_fn(model, xy, norm, morph, w):
 def colloc(morph_handler, n_bulk=1000, n_intf=300):
     xy_b = torch.rand(n_bulk, 2)
     mg = morph_handler.morph_grid; H, W = mg.shape
-    prob = (np.abs(np.gradient(mg,axis=0))+np.abs(np.gradient(mg,axis=1))).flatten()
+    grad_mag = np.abs(np.gradient(mg,axis=0))+np.abs(np.gradient(mg,axis=1))
+    prob = (grad_mag**2).flatten() 
     if prob.sum() > 0:
         prob /= prob.sum()
         idx = np.random.choice(H*W, size=n_intf, p=prob, replace=True)

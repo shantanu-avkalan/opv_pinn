@@ -37,3 +37,5 @@ ff_data
 scripts/runs
 scripts/opv_diag.py
 scripts/opv_pinn_generalised.py
+scripts/tests
+scripts/opv_pinn_direct.py

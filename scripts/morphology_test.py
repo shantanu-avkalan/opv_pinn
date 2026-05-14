@@ -1,13 +1,15 @@
 """
-OPV 2D PINN v6 — Final version before 10-morphology validation
-===============================================================
-All fixes applied:
-  FIX 1 — Gx_scale = min(1.0, kx_nd/Gx_nd)  — no generation amplification
-  FIX 2 — loss_scale = max(1, kx_nd/5)       — boosts Poisson for fast-decay
-  FIX 3 — J_scale_phys = J_scale/max(1,mu_p_nd) — corrects mu_p dominance
-  FIX 4 — BCs: n=1 at cathode, p=1 at anode (natural values, not n_majority)
-           J_scale_phys applied only at readout in compute_jsc
-  FIX 5 — Phase 2: n,p weights=0.1 (smooth transition, no loss spike)
+OPV 2D PINN v6 — dataset params validation, physics improvements
+=================================================================
+Changes from previous version:
+  CHG 2 — Shared encoder architecture (one encoder, four output heads)
+           Fewer params, more consistent field representations
+  CHG 3 — Adaptive curriculum: phase advances when loss actually converges
+           not at fixed epoch fractions
+  CHG 4 — Interface-weighted loss: 4x weight at donor-acceptor boundaries
+           Reduces sharp residual spikes at interfaces
+  CHG 5 — Squared gradient sampling + n_intf=600
+           More collocation points at sharpest interface regions
 
 Run:
     python opv_pinn_2d.py --data_dir /path/to/data --morph_idx 0
@@ -70,7 +72,6 @@ class NormParams:
         self.V0    = p.E_g
         self.VT_nd = p.VT/p.E_g
 
-        # Fixed J_scale regardless of mu_n
         _J_REF  = 3e21*(2e-7*p.VT)*p.q/p.Height
         self.n0 = _J_REF/(p.Dn*p.q/p.Height)
         self.tau0 = p.Height**2/p.Dn
@@ -84,10 +85,10 @@ class NormParams:
         self.kx_nd    = p.kx*self.tau0
         self.kdiss_nd = p.k_diss*self.tau0
 
-        # FIX 1: clamp Gx_scale to [0,1] — never amplify generation
+        # Gx_scale clamped to [0,1] — never amplify generation
         self.Gx_scale = min(1.0, self.kx_nd/self.Gx_nd) if self.Gx_nd > 1e-12 else 1.0
 
-        # FIX 2: loss_scale boosts Poisson when kx_nd is large
+        # loss_scale boosts Poisson when kx_nd is large
         self.loss_scale = float(np.clip(max(1.0, self.kx_nd/5.0), 1.0, 20.0))
 
         # krec: auto-balance D~R at Jsc conditions
@@ -100,17 +101,8 @@ class NormParams:
 
         self.debye_ratio = p.q*self.n0*p.Height**2/(p.eps_si*p.E_g)
         self.V_bi_nd     = V_bi_nd
-
-        # J_scale: base (used in physics equations)
-        self.J_scale = self.n0*p.Dn*p.q/p.Height  # A/m²
-
-        # FIX 3: J_scale_phys corrects for hole mobility dominance at readout
-        # When mu_p > mu_n, hole current dominates and raw J_nd is mu_p_nd× too large
-        # Dividing by max(1, mu_p_nd) at readout gives correct physical Jsc
-        # BCs stay at n=1, p=1 so interior physics is correct
-        self.J_scale_phys = self.J_scale / max(1.0, self.mu_p_nd)
-
-        # Ohmic minority carrier BC
+        self.J_scale     = self.n0*p.Dn*p.q/p.Height  # A/m²
+        self.J_scale_phys = self.J_scale * 2.0 / (1.0 + self.mu_p_nd)
         self.n_min = max(1e-4, math.exp(-V_bi_nd/(2*self.VT_nd)))
 
         self._sanity()
@@ -131,12 +123,15 @@ class NormParams:
         print(f"    J_scale    = {self.J_scale*0.1:.4f} mA/cm2/J_nd  (raw)")
         print(f"    J_scale_p  = {self.J_scale_phys*0.1:.4f} mA/cm2/J_nd  "
               f"(÷ max(1,{self.mu_p_nd:.1f}))")
-        # Expected BC Jsc using J_scale_phys
         nm = self.n_min; V = self.V_bi_nd
-        Jn = 1.0           * (1.0*(-V) + (1.0-nm))
-        Jp = self.mu_p_nd  * (nm *(-V) + (1.0-nm))
+        Jn = 1.0*(1.0*(-V)+(1.0-nm))
+        Jp = self.mu_p_nd*(nm*(-V)+(1.0-nm))
         Jsc_bc = abs(Jn+Jp)*self.J_scale_phys*0.1
         print(f"    BC Jsc~    = {Jsc_bc:.4f} mA/cm2  (before training)\n")
+        if self.kx_nd > 10.0:
+            print(f"    *** tau_x WARNING: kx_nd={self.kx_nd:.1f} >> 1")
+            print(f"    *** X≈0, photocurrent suppressed in PINN model")
+            print(f"    *** GT may use direct generation — results not comparable")
 
 
 # =============================================================================
@@ -161,6 +156,7 @@ def load_data(data_dir):
 
 # =============================================================================
 # SECTION 4 — MORPHOLOGY HANDLER
+# Sigmoid steepness reduced from 20 to 10 for smoother interface transition
 # =============================================================================
 class MorphologyHandler:
     def __init__(self, grid, norm):
@@ -177,7 +173,8 @@ class MorphologyHandler:
 
     def _phase(self,xy):
         p=self.interp(xy.detach().cpu().numpy()).astype(np.float32)
-        return torch.sigmoid(20*(torch.tensor(p).unsqueeze(1).to(xy.device)-0.5))
+        # Steepness 10 (was 20): smoother transition, more physically realistic
+        return torch.sigmoid(10*(torch.tensor(p).unsqueeze(1).to(xy.device)-0.5))
 
     def get_Gx(self,xy):
         return self.norm.Gx_nd*self.norm.Gx_scale*self._phase(xy)
@@ -192,42 +189,36 @@ class MorphologyHandler:
 
 
 # =============================================================================
-# SECTION 5 — NETWORK
+# SECTION 5 — NETWORK (CHG 2: shared encoder + four output heads)
 # =============================================================================
-class FieldNet(nn.Module):
-    def __init__(self,nh=5,nn_=96):
+class OPV_PINN_2D(nn.Module):
+    def __init__(self, norm, V_app_nd=0.0, nh=5, nn_=96):
         super().__init__()
+        self.norm=norm; self.V_app=V_app_nd; self.n_min=norm.n_min
+
+        # Shared encoder — learns spatial structure once for all four fields
         layers=[nn.Linear(2,nn_),nn.Tanh()]
         for _ in range(nh-1): layers+=[nn.Linear(nn_,nn_),nn.Tanh()]
-        layers.append(nn.Linear(nn_,1))
-        self.net=nn.Sequential(*layers)
-        for m in self.net.modules():
+        self.encoder  = nn.Sequential(*layers)
+
+        # Four specialised output heads
+        self.head_phi = nn.Linear(nn_,1)
+        self.head_n   = nn.Linear(nn_,1)
+        self.head_p   = nn.Linear(nn_,1)
+        self.head_X   = nn.Linear(nn_,1)
+
+        for m in self.modules():
             if isinstance(m,nn.Linear):
                 nn.init.xavier_normal_(m.weight); nn.init.zeros_(m.bias)
-    def forward(self,xy): return self.net(xy)
-
-
-class OPV_PINN_2D(nn.Module):
-    def __init__(self,norm,V_app_nd=0.0):
-        super().__init__()
-        self.norm=norm; self.V_app=V_app_nd
-        self.n_min=norm.n_min
-        self.net_phi=FieldNet(); self.net_n=FieldNet()
-        self.net_p=FieldNet();   self.net_X=FieldNet()
 
     def forward(self,xy):
         x=xy[:,0:1]; nm=self.n_min
-
+        z=self.encoder(xy)
         phi=(self.norm.V_bi_nd/2)*(1-x)+(-self.norm.V_bi_nd/2+self.V_app)*x \
-            +x*(1-x)*self.net_phi(xy)
-
-        # FIX 4: BCs at natural values — n=1 at cathode, p=1 at anode
-        # This keeps carrier densities in [0,1] for correct physics
-        # J_scale_phys handles the mu_p correction at readout only
-        n = nm*(1-x) + 1.0*x + x*(1-x)*F.softplus(self.net_n(xy))
-        p = 1.0*(1-x) + nm*x + x*(1-x)*F.softplus(self.net_p(xy))
-
-        X=x*(1-x)*F.softplus(self.net_X(xy)+1.0)
+            +x*(1-x)*self.head_phi(z)
+        n=nm*(1-x)+1.0*x+x*(1-x)*F.softplus(self.head_n(z))
+        p=1.0*(1-x)+nm*x+x*(1-x)*F.softplus(self.head_p(z))
+        X=x*(1-x)*F.softplus(self.head_X(z)+1.0)
         return phi,n,p,X
 
 
@@ -264,21 +255,37 @@ def residuals(model,xy,norm,morph):
 
 # =============================================================================
 # SECTION 7 — LOSS
+# CHG 3: get_w accepts explicit phase for adaptive curriculum
+# CHG 4: interface-weighted residuals (4x at donor-acceptor boundaries)
 # =============================================================================
-def get_w(ep, n_epochs, loss_scale=1.0):
-    f = ep/n_epochs; s = loss_scale
-    if f < 0.20:
-        return {'P': 20.0*s, 'n': 0.01, 'p': 0.01, 'X': 0.1*s, 'Jc': 0.0}
-    if f < 0.60:
-        # FIX 5: n,p=0.1 not 1.0 — prevents spike at phase transition
-        return {'P':  5.0*s, 'n':  0.1,  'p':  0.1,  'X': 0.5,  'Jc': 0.0}
-    return     {'P':  1.0*s, 'n':  1.0,  'p':  1.0,  'X': 1.0,  'Jc': 10.0}
+def get_w(ep, n_epochs, loss_scale=1.0, phase=None):
+    # CHG 3: explicit phase overrides epoch-based calculation
+    if phase is None:
+        f=ep/n_epochs
+        phase=0 if f<0.20 else (1 if f<0.60 else 2)
+    s=loss_scale
+    if phase==0:
+        return {'P':20.0*s,'n':0.01,'p':0.01,'X':0.1*s,'Jc':0.0}
+    if phase==1:
+        return {'P': 5.0*s,'n': 0.1,'p': 0.1,'X': 0.5, 'Jc':0.0}
+    return     {'P': 1.0*s,'n': 1.0,'p': 1.0,'X': 1.0, 'Jc':10.0}
 
 
 def loss_fn(model,xy,norm,morph,w):
     rP,rn,rp,rX=residuals(model,xy,norm,morph)
-    lP=w['P']*(rP**2).mean(); ln=w['n']*(rn**2).mean()
-    lp=w['p']*(rp**2).mean(); lX=w['X']*(rX**2).mean()
+
+    # CHG 4: interface-weighted loss
+    # 4*phase*(1-phase) peaks at 1.0 when phase=0.5 (at D-A boundary)
+    # intf_weight = 1 in bulk, 4 at interface
+    phase_vals  = morph._phase(xy).detach()
+    intf_mask   = 4.0*phase_vals*(1.0-phase_vals)
+    intf_weight = 1.0+3.0*intf_mask
+
+    lP=w['P']*(rP**2*intf_weight).mean()
+    ln=w['n']*(rn**2*intf_weight).mean()
+    lp=w['p']*(rp**2*intf_weight).mean()
+    lX=w['X']*(rX**2*intf_weight).mean()
+
     if w['Jc'] > 0:
         xy2=xy.detach().requires_grad_(True)
         phi2,n2,p2,_=model(xy2)
@@ -289,18 +296,31 @@ def loss_fn(model,xy,norm,morph,w):
         lJc=w['Jc']*(Jt.var()+0.5*((Jt-Jt.mean().detach())**2).mean())
     else:
         lJc=torch.tensor(0.0,device=xy.device)
-    total=lP+ln+lp+lX+lJc
+
+    with torch.no_grad():
+        _,n_v,p_v,_ = model(xy.detach())
+    n_excess = F.relu(n_v - 1.2)
+    p_excess = F.relu(p_v - 1.2)
+    l_pile   = w['n']*(n_excess**2).mean() + w['p']*(p_excess**2).mean()
+
+    total=lP+ln+lp+lX+lJc+l_pile
     return total,{'total':total.item(),'P':lP.item(),
-                  'n':ln.item(),'p':lp.item(),'X':lX.item(),'Jc':lJc.item()}
+                  'n':ln.item(),'p':lp.item(),'X':lX.item(),
+                  'Jc':lJc.item(),'pile':l_pile.item()}
 
 
 # =============================================================================
 # SECTION 8 — COLLOCATION POINTS
+# CHG 5: squared gradient magnitude + n_intf=600
 # =============================================================================
-def colloc(morph_handler,n_bulk=1000,n_intf=300):
+def colloc(morph_handler,n_bulk=1000,n_intf=600):
     xy_b=torch.rand(n_bulk,2)
     mg=morph_handler.morph_grid; H,W=mg.shape
-    prob=(np.abs(np.gradient(mg,axis=0))+np.abs(np.gradient(mg,axis=1))).flatten()
+
+    # CHG 5: square gradient magnitude for aggressive interface focus
+    grad_mag = np.abs(np.gradient(mg,axis=0))+np.abs(np.gradient(mg,axis=1))
+    prob = (grad_mag**2).flatten()
+
     if prob.sum()>0:
         prob/=prob.sum()
         idx=np.random.choice(H*W,size=n_intf,p=prob,replace=True)
@@ -309,6 +329,7 @@ def colloc(morph_handler,n_bulk=1000,n_intf=300):
         xy_i=torch.tensor(np.stack([xi,yi],axis=1),dtype=torch.float32)
     else:
         xy_i=torch.rand(n_intf,2)
+
     n_bl=200
     xa=np.random.uniform(0.001,0.015,n_bl)
     xc=np.random.uniform(0.985,0.999,n_bl)
@@ -319,7 +340,7 @@ def colloc(morph_handler,n_bulk=1000,n_intf=300):
 
 
 # =============================================================================
-# SECTION 9 — TRAINING
+# SECTION 9 — TRAINING (CHG 3: adaptive curriculum)
 # =============================================================================
 def train(model,norm,morph,name="",n_epochs=20000,lr=5e-4,pe=2000):
     xy=colloc(morph)
@@ -329,7 +350,20 @@ def train(model,norm,morph,name="",n_epochs=20000,lr=5e-4,pe=2000):
         if ep<warmup: return ep/warmup
         return 0.5*(1+math.cos(math.pi*(ep-warmup)/(n_epochs-warmup)))
     sch=torch.optim.lr_scheduler.LambdaLR(opt,lr_lambda)
-    hist={k:[] for k in ['total','P','n','p','X','Jc']}
+    hist={k:[] for k in ['total','P','n','p','X','Jc','pile']}
+
+    # CHG 3: adaptive phase — advances when loss actually converges
+    phase=0
+
+    def current_phase(ep, hist, phase):
+        if phase==0 and ep>500:
+            if len(hist['P'])>100 and np.mean(hist['P'][-100:])<0.1:
+                return 1
+        if phase==1 and ep>2000:
+            if len(hist['n'])>100:
+                if np.mean(hist['n'][-100:])+np.mean(hist['p'][-100:])<0.05:
+                    return 2
+        return phase
 
     print(f"\n{'='*60}")
     print(f"Training {name} | {n_epochs} epochs | {len(xy)} pts | lr={lr}")
@@ -337,12 +371,14 @@ def train(model,norm,morph,name="",n_epochs=20000,lr=5e-4,pe=2000):
           f"Poisson_w_phase1={20*norm.loss_scale:.1f}")
     print(f"{'='*60}")
     print(f"{'Ep':>6}  {'Total':>9}  {'Poisson':>9}  "
-          f"{'n':>8}  {'p':>8}  {'X':>8}  {'Jc':>8}  {'lr':>9}")
-    print("-"*72)
+          f"{'n':>8}  {'p':>8}  {'X':>8}  {'Jc':>8}  {'Ph':>4}  {'lr':>9}")
+    print("-"*78)
 
     for ep in range(n_epochs):
+        phase=current_phase(ep,hist,phase)
         opt.zero_grad()
-        loss,losses=loss_fn(model,xy,norm,morph,get_w(ep,n_epochs,norm.loss_scale))
+        loss,losses=loss_fn(model,xy,norm,morph,
+                            get_w(ep,n_epochs,norm.loss_scale,phase))
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(),0.5)
         opt.step(); sch.step()
@@ -351,14 +387,12 @@ def train(model,norm,morph,name="",n_epochs=20000,lr=5e-4,pe=2000):
             print(f"{ep:>6}  {losses['total']:>9.3e}  {losses['P']:>9.3e}  "
                   f"{losses['n']:>8.3e}  {losses['p']:>8.3e}  "
                   f"{losses['X']:>8.3e}  {losses['Jc']:>8.3e}  "
-                  f"{opt.param_groups[0]['lr']:.2e}")
+                  f"{phase:>4}  {opt.param_groups[0]['lr']:.2e}")
     return hist
 
 
 # =============================================================================
 # SECTION 10 — JSC
-# FIX 4: use J_scale_phys (not J_scale) to convert J_nd -> mA/cm²
-# This corrects for hole mobility dominance when mu_p > mu_n
 # =============================================================================
 def compute_jsc(model,norm,n_pts=300):
     model.eval()
@@ -379,7 +413,6 @@ def compute_jsc(model,norm,n_pts=300):
         Jt=(Jn+Jp).detach().cpu().numpy().flatten()
         Jsc_vals.append(abs(float(np.mean(Jt))))
 
-    # FIX 4: use J_scale_phys here — only place the correction is applied
     Jsc=float(np.mean(Jsc_vals))*norm.J_scale_phys*0.1
 
     xy2=torch.cat([torch.full((n_pts,1),0.995),
@@ -567,7 +600,7 @@ def main():
     args=ap.parse_args(); os.makedirs(args.save_dir,exist_ok=True)
 
     print("="*55)
-    print("OPV 2D PINN v6 — final, all fixes applied")
+    print("OPV 2D PINN v6 — shared encoder + interface weighting")
     print("="*55)
 
     morphs,params,jsc=load_data(args.data_dir)
